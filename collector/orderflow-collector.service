@@ -1,0 +1,17 @@
+[Unit]
+Description=OrderFlow Delta & Big Order Collector
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/var/www/sites/clitools.app/wwwroot/orderflowtest/collector
+ExecStart=/usr/bin/node collector.js
+Restart=always
+RestartSec=5
+StandardOutput=append:/var/log/orderflow-collector.log
+StandardError=append:/var/log/orderflow-collector.log
+Environment=NODE_ENV=production
+
+[Install]
+WantedBy=multi-user.target

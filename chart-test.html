@@ -1,0 +1,66 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Chart Test</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { background: #0a0a0f; height: 100vh; }
+        .container { display: flex; flex-direction: column; height: 100vh; }
+        .header { height: 50px; background: #111; border-bottom: 1px solid #333; }
+        .chart-area { flex: 1; position: relative; background: #0a0a0f; }
+        #chart { position: absolute; top: 0; left: 0; right: 0; bottom: 0; background: #1a1a2e; }
+        #chart.with-delta { bottom: 155px; }
+        #delta { position: absolute; left: 0; right: 0; bottom: 0; height: 155px; background: #2a2a3e; display: none; }
+        #delta.visible { display: block; }
+        button { padding: 10px 20px; margin: 10px; cursor: pointer; }
+        #info { position: absolute; top: 60px; left: 10px; color: yellow; font-family: monospace; background: rgba(0,0,0,0.8); padding: 10px; z-index: 100; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <button onclick="toggleDelta()">Toggle Delta</button>
+            <span id="status" style="color:white;margin-left:20px;">Delta: OFF</span>
+        </div>
+        <div class="chart-area">
+            <div id="info"></div>
+            <div id="chart"></div>
+            <div id="delta"></div>
+        </div>
+    </div>
+    <script>
+        let deltaOn = false;
+        const chart = document.getElementById('chart');
+        const delta = document.getElementById('delta');
+        const info = document.getElementById('info');
+        const status = document.getElementById('status');
+        
+        function updateInfo() {
+            const chartArea = document.querySelector('.chart-area');
+            const chartRect = chart.getBoundingClientRect();
+            const areaRect = chartArea.getBoundingClientRect();
+            info.innerHTML = `Delta: ${deltaOn ? 'ON' : 'OFF'}<br>` +
+                `Chart Area: ${Math.round(areaRect.width)}x${Math.round(areaRect.height)}<br>` +
+                `Chart: ${Math.round(chartRect.width)}x${Math.round(chartRect.height)}<br>` +
+                `Chart Bottom: ${Math.round(chartRect.bottom)}<br>` +
+                `Area Bottom: ${Math.round(areaRect.bottom)}`;
+        }
+        
+        function toggleDelta() {
+            deltaOn = !deltaOn;
+            if (deltaOn) {
+                chart.classList.add('with-delta');
+                delta.classList.add('visible');
+            } else {
+                chart.classList.remove('with-delta');
+                delta.classList.remove('visible');
+            }
+            status.textContent = 'Delta: ' + (deltaOn ? 'ON' : 'OFF');
+            setTimeout(updateInfo, 100);
+        }
+        
+        updateInfo();
+        setInterval(updateInfo, 500);
+    </script>
+</body>
+</html>

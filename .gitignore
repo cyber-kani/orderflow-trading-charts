@@ -1,0 +1,43 @@
+# Dependencies
+node_modules/
+package-lock.json
+
+# Screenshots and images
+*.png
+*.jpg
+*.jpeg
+*.gif
+
+# Environment and secrets
+.env
+*.env
+config.cfm
+
+# IDE and editor files
+.claude/
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# PM2
+.pm2/
+
+# Temporary files
+*.tmp
+*.temp
+
+# Rust build artifacts
+iqfeed-bridge/target/
+
+# Service files with credentials
+orderflowtest-redis-sync.service
+redis_sync_service.py

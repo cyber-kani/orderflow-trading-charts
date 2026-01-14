@@ -1,0 +1,14 @@
+{
+  "name": "orderflow-collector",
+  "version": "1.0.0",
+  "description": "Background delta and big order collector for orderflow tracking",
+  "main": "collector.js",
+  "scripts": {
+    "start": "node collector.js",
+    "dev": "node collector.js"
+  },
+  "dependencies": {
+    "ws": "^8.14.2",
+    "mssql": "^10.0.1"
+  }
+}
