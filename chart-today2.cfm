@@ -1865,6 +1865,7 @@
         //=============================================================================
         let initialLoadDone = false;
         let isTimeframeChange = false;  // Track if we're switching timeframes
+        let savedTimeRange = null;  // Preserve zoom level across timeframe changes
 
         function handleHistoricalCandles(candles) {
             if (!candles || candles.length === 0) return;
@@ -2032,27 +2033,52 @@
             requestAnimationFrame(() => {
                 if (candleData.length === 0) return;
 
-                const deltaZoomBars = showDeltaStats ? 40 : 100;
                 const intervalSeconds = TIMEFRAME_MINUTES[TIMEFRAME] * 60;
                 const lastCandleTime = candleData[candleData.length - 1].time;
+                const firstCandleTime = candleData[0].time;
 
-                let barsToShow = deltaZoomBars;
-                if (isTimeframeChange) {
-                    barsToShow = Math.min(deltaZoomBars, candleData.length);
-                    isTimeframeChange = false;
-                } else if (showDeltaStats) {
-                    barsToShow = Math.min(40, candleData.length);
-                } else if (showBigOrders) {
-                    barsToShow = 25;
-                } else {
-                    barsToShow = Math.min(100, candleData.length);
+                // Preserve time range across timeframe changes
+                if (isTimeframeChange && savedTimeRange) {
+                    // Only restore if we have enough historical data (firstCandleTime should be before our saved range)
+                    // If firstCandleTime is after savedTimeRange.from, we don't have full history yet - wait
+                    if (firstCandleTime <= savedTimeRange.from || candleData.length > 50) {
+                        // We have enough data to restore the range
+                        const clampedFrom = Math.max(savedTimeRange.from, firstCandleTime);
+                        const clampedTo = Math.min(savedTimeRange.to, lastCandleTime + intervalSeconds);
+
+                        console.log(`[TF] Restoring time range: ${new Date(clampedFrom * 1000).toLocaleTimeString()} - ${new Date(clampedTo * 1000).toLocaleTimeString()} (${candleData.length} candles)`);
+
+                        chart.timeScale().setVisibleRange({
+                            from: clampedFrom,
+                            to: clampedTo
+                        });
+
+                        savedTimeRange = null;
+                        isTimeframeChange = false;
+                    } else {
+                        console.log(`[TF] Waiting for more data: firstCandle=${new Date(firstCandleTime * 1000).toLocaleTimeString()}, savedFrom=${new Date(savedTimeRange.from * 1000).toLocaleTimeString()}, candles=${candleData.length}`);
+                        // Don't clear savedTimeRange - wait for next historical_candles call
+                    }
+                } else if (!isTimeframeChange) {
+                    // Normal zoom for initial load or periodic sync
+                    const deltaZoomBars = showDeltaStats ? 40 : 100;
+                    let barsToShow = deltaZoomBars;
+
+                    if (showDeltaStats) {
+                        barsToShow = Math.min(40, candleData.length);
+                    } else if (showBigOrders) {
+                        barsToShow = 25;
+                    } else {
+                        barsToShow = Math.min(100, candleData.length);
+                    }
+
+                    const fromTime = lastCandleTime - (barsToShow * intervalSeconds);
+                    chart.timeScale().setVisibleRange({
+                        from: fromTime,
+                        to: lastCandleTime + intervalSeconds
+                    });
                 }
-
-                const fromTime = lastCandleTime - (barsToShow * intervalSeconds);
-                chart.timeScale().setVisibleRange({
-                    from: fromTime,
-                    to: lastCandleTime + intervalSeconds
-                });
+                // If isTimeframeChange but no savedTimeRange, wait for next historical_candles
 
                 // Reset zoomedOutHidden since we just zoomed in
                 // Also restore button states and render big orders
@@ -3148,6 +3174,13 @@
         //=============================================================================
         async function switchTimeframe(newTimeframe) {
             if (newTimeframe === TIMEFRAME) return;
+
+            // Save current visible time range before switching
+            const visibleRange = chart.timeScale().getVisibleRange();
+            if (visibleRange) {
+                savedTimeRange = { from: visibleRange.from, to: visibleRange.to };
+                console.log(`[TF] Saving time range: ${new Date(savedTimeRange.from * 1000).toLocaleTimeString()} - ${new Date(savedTimeRange.to * 1000).toLocaleTimeString()}`);
+            }
 
             TIMEFRAME = newTimeframe;
 
