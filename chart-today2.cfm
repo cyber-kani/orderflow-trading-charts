@@ -754,470 +754,126 @@
         let oneMinuteDeltaData = new Map();
         let oneMinuteOrderflow = new Map();  // 1m orderflow accumulation
 
-        // Delta data API endpoints
-        const DELTA_API_URL = '/orderflowtest/api/delta-data.cfm';  // Redis (legacy)
-        const DB_API_URL = '/orderflowtest/api/orderflow-data.cfm'; // Database (persistent)
-
-        // Debounce timer for saving
-        let saveDeltaTimeout = null;
+        // Delta data API endpoint (Database only - background collector saves data)
+        const DB_API_URL = '/orderflowtest/api/orderflow-data.cfm';
 
         //=============================================================================
-        // DELTA DATA PERSISTENCE (Redis via API)
+        // DELTA DATA LOADING (Database only - collector saves in background)
         //=============================================================================
-        function saveDeltaData() {
-            // Debounce saves to avoid hammering the API
-            if (saveDeltaTimeout) {
-                clearTimeout(saveDeltaTimeout);
-            }
-            saveDeltaTimeout = setTimeout(() => {
-                saveDeltaDataNow();
-            }, 2000);  // Save at most every 2 seconds
-        }
-
-        async function saveDeltaDataNow() {
-            try {
-                const data = {};
-
-                // Log bigOrderTrades state at save time
-                console.log(`[SAVE] bigOrderTrades.length = ${bigOrderTrades.length}`);
-                if (bigOrderTrades.length > 0) {
-                    console.log(`[SAVE] First 3 bigOrderTrades:`, JSON.stringify(bigOrderTrades.slice(0, 3)));
-                }
-
-                // First, add all delta data
-                candleDeltaData.forEach((value, key) => {
-                    // Only save real data (not estimated)
-                    if (!value.estimated) {
-                        // Find matching candle to save with delta
-                        const keyNum = Number(key);
-                        const candle = candleData.find(c => c.time === keyNum);
-                        // Get individual big order trades for this candle (exact prices)
-                        // Use Number() to ensure type match
-                        const tradesForCandle = bigOrderTrades.filter(t => Number(t.time) === keyNum);
-                        // Build record - only include bigOrderTrades if we have some
-                        // (don't send null as it would overwrite existing data in Redis)
-                        const record = {
-                            ...value,
-                            candle: candle ? { o: candle.open, h: candle.high, l: candle.low, c: candle.close, v: candle.volume } : null
-                        };
-                        if (tradesForCandle.length > 0) {
-                            record.bigOrderTrades = tradesForCandle;
-                        }
-                        data[key] = record;
-                    }
-                });
-
-                // Also save any big orders that don't have delta data yet
-                const candleTimesWithBigOrders = new Set(bigOrderTrades.map(t => Number(t.time)));
-                console.log(`[SAVE] Unique big order timestamps: ${[...candleTimesWithBigOrders].join(', ')}`);
-                candleTimesWithBigOrders.forEach(candleTime => {
-                    const candleTimeKey = String(candleTime);
-                    if (!data[candleTimeKey]) {
-                        // Create minimal record for this candle with just big orders
-                        const candle = candleData.find(c => c.time === candleTime);
-                        const tradesForCandle = bigOrderTrades.filter(t => Number(t.time) === candleTime);
-                        console.log(`[SAVE] Creating new record for timestamp ${candleTime} with ${tradesForCandle.length} big orders`);
-                        data[candleTimeKey] = {
-                            delta: 0,
-                            volume: 0,
-                            buyVolume: 0,
-                            sellVolume: 0,
-                            candle: candle ? { o: candle.open, h: candle.high, l: candle.low, c: candle.close, v: candle.volume } : null,
-                            bigOrderTrades: tradesForCandle
-                        };
-                    }
-                });
-
-                // Debug: log bigOrderTrades timestamps vs candleDeltaData keys
-                if (bigOrderTrades.length > 0) {
-                    const bigOrderTimes = [...new Set(bigOrderTrades.map(t => Number(t.time)))];
-                    const deltaDataKeys = [...candleDeltaData.keys()].map(k => Number(k));
-                    console.log(`[SAVE] BigOrders timestamps: ${bigOrderTimes.join(', ')}`);
-                    console.log(`[SAVE] DeltaData keys (last 3): ${deltaDataKeys.slice(-3).join(', ')}`);
-                    // Check overlap
-                    const matchedKeys = bigOrderTimes.filter(t => deltaDataKeys.includes(t));
-                    console.log(`[SAVE] Matched timestamps: ${matchedKeys.length}/${bigOrderTimes.length}`);
-                }
-
-                const bigOrderCount = [...Object.values(data)].filter(d => d.bigOrderTrades && d.bigOrderTrades.length > 0).length;
-                if (bigOrderCount > 0) {
-                    console.log(`Saving ${Object.keys(data).length} records (${bigOrderCount} candles with big orders, ${bigOrderTrades.length} total trades)`);
-                    // Log sample for debugging
-                    const sampleKey = Object.keys(data).find(k => data[k].bigOrderTrades && data[k].bigOrderTrades.length > 0);
-                    if (sampleKey) {
-                        console.log('Save sample:', sampleKey, JSON.stringify(data[sampleKey].bigOrderTrades?.slice(0, 2)));
-                    }
-                } else if (bigOrderTrades.length > 0) {
-                    console.log(`WARNING: ${bigOrderTrades.length} bigOrderTrades exist but none matched data keys!`);
-                }
-
-                if (Object.keys(data).length === 0) return;
-
-                const response = await fetch(`${DELTA_API_URL}?symbol=${CONFIG.symbol}&timeframe=${TIMEFRAME}`, {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify(data)
-                });
-
-                if (!response.ok) {
-                    console.warn('Failed to save delta data: HTTP', response.status);
-                    return;
-                }
-
-                const text = await response.text();
-                if (text) {
-                    try {
-                        const result = JSON.parse(text);
-                        if (result.success) {
-                            console.log(`Saved ${result.count} delta records to Redis`);
-                        } else {
-                            console.warn('Failed to save delta data:', result.error);
-                        }
-                    } catch (e) {
-                        console.warn('Invalid JSON response from save:', text.substring(0, 100));
-                    }
-                }
-
-                // ALWAYS save 1m data to Redis (for aggregation into any timeframe)
-                if (TIMEFRAME !== '1m' && oneMinuteDeltaData.size > 0) {
-                    const data1m = {};
-                    oneMinuteDeltaData.forEach((value, key) => {
-                        const keyNum = Number(key);
-                        // Include big orders that belong to this 1m bucket
-                        const tradesFor1m = bigOrderTrades.filter(t => Number(t.time) === keyNum);
-                        data1m[key] = {
-                            ...value,
-                            bigOrderTrades: tradesFor1m.length > 0 ? tradesFor1m : undefined
-                        };
-                    });
-                    // Also add big orders that might not have delta data yet
-                    bigOrderTrades.forEach(order => {
-                        const key = String(order.time);
-                        if (!data1m[key]) {
-                            data1m[key] = {
-                                delta: 0, volume: 0, buyVolume: 0, sellVolume: 0,
-                                bigOrderTrades: [order]
-                            };
-                        }
-                    });
-                    if (Object.keys(data1m).length > 0) {
-                        try {
-                            const response1m = await fetch(`${DELTA_API_URL}?symbol=${CONFIG.symbol}&timeframe=1m`, {
-                                method: 'POST',
-                                headers: { 'Content-Type': 'application/json' },
-                                body: JSON.stringify(data1m)
-                            });
-                            if (response1m.ok) {
-                                const result1m = await response1m.json();
-                                if (result1m.success) {
-                                    console.log(`[1m] Also saved ${result1m.count} 1m delta records with big orders`);
-                                }
-                            }
-                        } catch (e1m) {
-                            console.warn('[1m] Failed to save 1m data:', e1m.message);
-                        }
-                    }
-                }
-
-                // Also save to database for persistent storage (all timeframes)
-                await saveToDatabaseAsync(data);
-
-            } catch (e) {
-                console.warn('Failed to save delta data:', e.message);
-            }
-        }
-
-        // Save to database API (persistent storage for all timeframes)
-        async function saveToDatabaseAsync(data) {
-            try {
-                // Convert data format for database API
-                const deltaRecords = [];
-                const bigOrders = [];
-
-                Object.keys(data).forEach(key => {
-                    const record = data[key];
-                    const candleTime = parseInt(key);
-
-                    // Add delta record
-                    deltaRecords.push({
-                        time: candleTime,
-                        delta: record.delta || 0,
-                        maxDelta: record.maxDelta || record.delta || 0,
-                        minDelta: record.minDelta || record.delta || 0,
-                        volume: record.volume || 0,
-                        buyVolume: record.buyVolume || 0,
-                        sellVolume: record.sellVolume || 0,
-                        candle: record.candle || null,
-                        estimated: record.estimated || false
-                    });
-
-                    // Add big orders if present
-                    if (record.bigOrderTrades && Array.isArray(record.bigOrderTrades)) {
-                        record.bigOrderTrades.forEach(trade => {
-                            bigOrders.push({
-                                time: Number(trade.time || candleTime),
-                                price: Number(trade.price),
-                                size: Number(trade.size),
-                                side: trade.side
-                            });
-                        });
-                    }
-                });
-
-                if (deltaRecords.length === 0) return;
-
-                const payload = {
-                    symbol: CONFIG.symbol,
-                    timeframe: TIMEFRAME,
-                    delta: deltaRecords,
-                    bigOrders: bigOrders
-                };
-
-                const dbResponse = await fetch(`${DB_API_URL}?action=save_all`, {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify(payload)
-                });
-
-                if (dbResponse.ok) {
-                    const dbResult = await dbResponse.json();
-                    if (dbResult.success) {
-                        console.log(`[DB] Saved ${dbResult.deltaSaved} delta, ${dbResult.ordersSaved} big orders`);
-                    }
-                }
-            } catch (e) {
-                console.warn('[DB] Failed to save to database:', e.message);
-            }
-        }
-
         async function loadDeltaData() {
             try {
-                console.log(`Loading delta data for ${CONFIG.symbol}/${TIMEFRAME}...`);
+                console.log(`[DB] Loading delta data for ${CONFIG.symbol}/${TIMEFRAME} from database...`);
                 var ver = document.getElementById('version');
-                if (ver) ver.textContent = 'v157 LOADING...';
+                if (ver) ver.textContent = 'v158 LOADING...';
 
-                // Version tracking (no longer clears data on version change)
-                const dataVersion = localStorage.getItem('mboDataVersion');
-                if (dataVersion !== 'v157') {
-                    console.log('[Version] Upgrading to v157 - preserving existing data');
-                    localStorage.setItem('mboDataVersion', 'v157');
-                }
+                // Calculate time range (last 24 hours)
+                const now = Math.floor(Date.now() / 1000);
+                const twentyFourHoursAgo = now - (24 * 60 * 60);
 
-                // First load the native timeframe data
-                const response = await fetch(`${DELTA_API_URL}?symbol=${CONFIG.symbol}&timeframe=${TIMEFRAME}`);
+                // Load 1m data from database (for aggregation into any timeframe)
+                const response = await fetch(
+                    `${DB_API_URL}?action=get_all&symbol=${CONFIG.symbol}&timeframe=1m&start=${twentyFourHoursAgo}&delta_limit=10000&order_limit=2000`
+                );
 
                 if (!response.ok) {
-                    console.warn('Failed to load delta data: HTTP', response.status);
-                    if (ver) ver.textContent = 'v157 LOAD ERR';
+                    console.warn('[DB] Failed to load from database: HTTP', response.status);
+                    if (ver) ver.textContent = 'v158 LOAD ERR';
                     return;
                 }
 
-                const text = await response.text();
+                const result = await response.json();
                 let loadedCount = 0;
-                let candleCount = 0;
                 let bigOrderCount = 0;
                 savedCandles.clear();
 
-                if (text) {
-                    try {
-                        const result = JSON.parse(text);
-                        if (result.success && result.data) {
-                            // Debug: check for bigOrderTrades in any record
-                            const allKeys = Object.keys(result.data);
-                            const keysWithBigOrders = allKeys.filter(k => {
-                                const trades = result.data[k].bigOrderTrades || result.data[k].BIGORDERTRADES;
-                                return trades && Array.isArray(trades) && trades.length > 0;
-                            });
-                            console.log(`[Redis ${TIMEFRAME}] Total records: ${allKeys.length}, records with bigOrders: ${keysWithBigOrders.length}`);
-                            if (keysWithBigOrders.length > 0) {
-                                const sample = result.data[keysWithBigOrders[0]].bigOrderTrades || result.data[keysWithBigOrders[0]].BIGORDERTRADES;
-                                console.log(`[Redis ${TIMEFRAME}] Sample big order:`, JSON.stringify(sample[0]));
+                if (result.success || result.SUCCESS) {
+                    const intervalSeconds = TIMEFRAME_MINUTES[TIMEFRAME] * 60;
+
+                    // Handle ColdFusion uppercase keys
+                    const deltaResult = result.delta || result.DELTA;
+                    const bigOrdersResult = result.bigOrders || result.BIGORDERS;
+
+                    // Load and aggregate 1m delta data into current timeframe
+                    if (deltaResult && (deltaResult.data || deltaResult.DATA)) {
+                        const deltaData = deltaResult.data || deltaResult.DATA;
+                        const aggregated = new Map();
+
+                        Object.keys(deltaData).forEach(key => {
+                            const ts1m = parseInt(key);
+                            const record = deltaData[key];
+
+                            // Calculate which bucket this 1m record belongs to
+                            const bucketTime = Math.floor(ts1m / intervalSeconds) * intervalSeconds;
+
+                            if (!aggregated.has(bucketTime)) {
+                                aggregated.set(bucketTime, {
+                                    delta: 0,
+                                    maxDelta: -Infinity,
+                                    minDelta: Infinity,
+                                    volume: 0,
+                                    buyVolume: 0,
+                                    sellVolume: 0
+                                });
                             }
-                            Object.keys(result.data).forEach(key => {
-                                const timestamp = parseInt(key);
-                                const record = result.data[key];
-                                // Extract candle data if present (handle CF uppercase keys)
-                                const candle = record.candle || record.CANDLE;
-                                if (candle) {
-                                    savedCandles.set(timestamp, {
-                                        time: timestamp,
-                                        open: candle.o || candle.O,
-                                        high: candle.h || candle.H,
-                                        low: candle.l || candle.L,
-                                        close: candle.c || candle.C,
-                                        volume: candle.v || candle.V || 0
-                                    });
-                                    candleCount++;
+
+                            const agg = aggregated.get(bucketTime);
+                            // Handle CF uppercase keys
+                            agg.delta += (record.delta || record.DELTA || 0);
+                            agg.maxDelta = Math.max(agg.maxDelta, agg.delta);
+                            agg.minDelta = Math.min(agg.minDelta, agg.delta);
+                            agg.volume += (record.volume || record.VOLUME || 0);
+                            agg.buyVolume += (record.buyVolume || record.BUYVOLUME || 0);
+                            agg.sellVolume += (record.sellVolume || record.SELLVOLUME || 0);
+                        });
+
+                        // Add aggregated data to candleDeltaData
+                        aggregated.forEach((data, bucketTime) => {
+                            if (data.maxDelta === -Infinity) data.maxDelta = data.delta;
+                            if (data.minDelta === Infinity) data.minDelta = data.delta;
+                            candleDeltaData.set(bucketTime, data);
+                            loadedCount++;
+                        });
+
+                        console.log(`[DB] Loaded ${loadedCount} delta records (aggregated from 1m to ${TIMEFRAME})`);
+                    }
+
+                    // Load big orders and map to current timeframe buckets
+                    if (bigOrdersResult && (bigOrdersResult.data || bigOrdersResult.DATA)) {
+                        const bigOrdersData = bigOrdersResult.data || bigOrdersResult.DATA;
+                        bigOrdersData.forEach(order => {
+                            const ts1m = Number(order.time || order.TIME);
+                            // Map to current timeframe bucket
+                            const bucketTime = Math.floor(ts1m / intervalSeconds) * intervalSeconds;
+
+                            const t = {
+                                time: bucketTime,  // Use bucket time for display alignment
+                                price: Number(order.price || order.PRICE),
+                                size: Number(order.size || order.SIZE),
+                                side: order.side || order.SIDE
+                            };
+                            if (t.price && t.size && t.side) {
+                                const sidePrefix = t.side === 'BUY' ? 'B' : 'A';
+                                const orderKey = `${sidePrefix}_${t.price}_${t.size}_${bucketTime}`;
+                                if (!seenMBOOrders.has(orderKey)) {
+                                    seenMBOOrders.add(orderKey);
+                                    bigOrderTrades.push(t);
+                                    bigOrderCount++;
                                 }
-                                // Load individual big order trades with exact prices
-                                const trades = record.bigOrderTrades || record.BIGORDERTRADES;
-                                if (trades && Array.isArray(trades) && trades.length > 0) {
-                                    if (bigOrderCount === 0) {
-                                        console.log(`[LOAD 1m] First record with big orders at ${timestamp}:`, JSON.stringify(trades[0]));
-                                    }
-                                    trades.forEach(trade => {
-                                        // Handle CF uppercase keys and ensure numeric values
-                                        const t = {
-                                            time: Number(trade.time || trade.TIME || timestamp),
-                                            price: Number(trade.price || trade.PRICE),
-                                            size: Number(trade.size || trade.SIZE),
-                                            side: trade.side || trade.SIDE
-                                        };
-                                        if (t.price && t.size && t.side && !isNaN(t.price) && !isNaN(t.size)) {
-                                            // Add to seenMBOOrders to prevent duplicates when live data arrives
-                                            // Key format: B/A_price_size (B=bids/BUY, A=asks/SELL)
-                                            const sidePrefix = t.side === 'BUY' ? 'B' : 'A';
-                                            const orderKey = `${sidePrefix}_${t.price}_${t.size}`;
-                                            if (!seenMBOOrders.has(orderKey)) {
-                                                seenMBOOrders.add(orderKey);
-                                                bigOrderTrades.push(t);
-                                                bigOrderCount++;
-                                            }
-                                        }
-                                    });
-                                } else if (record.bigOrderTrades !== null && record.bigOrderTrades !== undefined) {
-                                    console.log('bigOrderTrades exists but not array:', typeof record.bigOrderTrades, record.bigOrderTrades);
-                                }
-                                // Store delta data (normalize CF uppercase keys to lowercase)
-                                const deltaOnly = {
-                                    delta: record.delta || record.DELTA || 0,
-                                    maxDelta: record.maxDelta || record.MAXDELTA || 0,
-                                    minDelta: record.minDelta || record.MINDELTA || 0,
-                                    volume: record.volume || record.VOLUME || 0,
-                                    buyVolume: record.buyVolume || record.BUYVOLUME || 0,
-                                    sellVolume: record.sellVolume || record.SELLVOLUME || 0
-                                };
-                                candleDeltaData.set(timestamp, deltaOnly);
-                                loadedCount++;
-                            });
-                            console.log(`Loaded ${loadedCount} native ${TIMEFRAME} delta records, ${bigOrderCount} big order trades, ${candleCount} candles`);
-                        }
-                    } catch (e) {
-                        console.warn('Invalid JSON response from load:', text.substring(0, 100));
+                            }
+                        });
+
+                        console.log(`[DB] Loaded ${bigOrderCount} big orders from database`);
                     }
                 }
 
-                // For higher timeframes, also aggregate 1m data
-                if (TIMEFRAME !== '1m') {
-                    try {
-                        const response1m = await fetch(`${DELTA_API_URL}?symbol=${CONFIG.symbol}&timeframe=1m`);
-                        if (response1m.ok) {
-                            const text1m = await response1m.text();
-                            if (text1m) {
-                                const result1m = JSON.parse(text1m);
-                                if (result1m.success && result1m.data) {
-                                    const intervalSeconds = TIMEFRAME_MINUTES[TIMEFRAME] * 60;
-                                    const aggregated = new Map();
-                                    let aggregatedFrom1m = 0;
-                                    let skippedExisting = 0;
-                                    const oneM_keys = Object.keys(result1m.data);
-
-                                    console.log(`1m aggregation: processing ${oneM_keys.length} 1m records into ${TIMEFRAME} buckets (${intervalSeconds}s interval)`);
-
-                                    // Aggregate 1m deltas into current timeframe buckets
-                                    oneM_keys.forEach(key => {
-                                        const ts1m = parseInt(key);
-                                        const record = result1m.data[key];
-                                        // Calculate which candle bucket this 1m delta belongs to
-                                        const bucketTime = Math.floor(ts1m / intervalSeconds) * intervalSeconds;
-
-                                        // Skip if we already have native data for this bucket
-                                        if (candleDeltaData.has(bucketTime)) {
-                                            skippedExisting++;
-                                            return;
-                                        }
-
-                                        if (!aggregated.has(bucketTime)) {
-                                            aggregated.set(bucketTime, {
-                                                delta: 0,
-                                                maxDelta: -Infinity,
-                                                minDelta: Infinity,
-                                                volume: 0,
-                                                buyVolume: 0,
-                                                sellVolume: 0
-                                            });
-                                        }
-                                        const agg = aggregated.get(bucketTime);
-                                        agg.delta += (record.delta || 0);
-                                        agg.maxDelta = Math.max(agg.maxDelta, agg.delta);
-                                        agg.minDelta = Math.min(agg.minDelta, agg.delta);
-                                        agg.volume += (record.volume || 0);
-                                        agg.buyVolume += (record.buyVolume || 0);
-                                        agg.sellVolume += (record.sellVolume || 0);
-                                    });
-
-                                    // Add aggregated data to candleDeltaData
-                                    aggregated.forEach((data, bucketTime) => {
-                                        if (!candleDeltaData.has(bucketTime)) {
-                                            // Fix Infinity values
-                                            if (data.maxDelta === -Infinity) data.maxDelta = data.delta;
-                                            if (data.minDelta === Infinity) data.minDelta = data.delta;
-                                            candleDeltaData.set(bucketTime, data);
-                                            aggregatedFrom1m++;
-                                        }
-                                    });
-
-                                    console.log(`1m aggregation result: ${aggregatedFrom1m} new buckets, ${skippedExisting} skipped (had native), ${aggregated.size} unique buckets from 1m`);
-                                    loadedCount += aggregatedFrom1m;
-
-                                    // ALSO load big orders from 1m data and map to current timeframe
-                                    let bigOrdersFrom1m = 0;
-                                    let recordsWithBigOrders = 0;
-                                    oneM_keys.forEach(key => {
-                                        const ts1m = parseInt(key);
-                                        const record = result1m.data[key];
-                                        const bucketTime = Math.floor(ts1m / intervalSeconds) * intervalSeconds;
-
-                                        // Load big orders from 1m record
-                                        const trades = record.bigOrderTrades || record.BIGORDERTRADES;
-                                        if (trades && Array.isArray(trades) && trades.length > 0) {
-                                            recordsWithBigOrders++;
-                                            trades.forEach(trade => {
-                                                const t = {
-                                                    time: bucketTime,  // Map to current TF bucket
-                                                    price: Number(trade.price || trade.PRICE),
-                                                    size: Number(trade.size || trade.SIZE),
-                                                    side: trade.side || trade.SIDE
-                                                };
-                                                if (t.price && t.size && t.side && !isNaN(t.price) && !isNaN(t.size)) {
-                                                    const sidePrefix = t.side === 'BUY' ? 'B' : 'A';
-                                                    const orderKey = `${sidePrefix}_${t.price}_${t.size}_${bucketTime}`;
-                                                    if (!seenMBOOrders.has(orderKey)) {
-                                                        seenMBOOrders.add(orderKey);
-                                                        bigOrderTrades.push(t);
-                                                        bigOrdersFrom1m++;
-                                                    }
-                                                }
-                                            });
-                                        }
-                                    });
-                                    console.log(`[1m->TF] Checked ${oneM_keys.length} 1m records, ${recordsWithBigOrders} had big orders, loaded ${bigOrdersFrom1m} orders for ${TIMEFRAME}`);
-                                    if (bigOrdersFrom1m > 0) {
-                                        bigOrderCount += bigOrdersFrom1m;
-                                    }
-                                }
-                            }
-                        }
-                    } catch (e) {
-                        console.warn('Failed to aggregate 1m data:', e.message);
-                    }
-                }
-
-                // ALWAYS load from database to get historical data from collector
-                // This supplements Redis data with longer-term historical data
-                console.log('[DB] Loading historical data from database...');
-                const dbLoaded = await loadFromDatabaseAsync();
-                loadedCount += dbLoaded.deltaCount;
-                bigOrderCount += dbLoaded.bigOrderCount;
-
-                if (ver) ver.textContent = 'v157 (' + loadedCount + ' deltas)';
+                if (ver) ver.textContent = 'v158 (' + loadedCount + ' deltas)';
                 if (loadedCount > 0) {
                     const keys = Array.from(candleDeltaData.keys()).sort((a, b) => a - b);
                     const sampleKey = keys[0];
                     const sampleDate = new Date(sampleKey * 1000);
-                    console.log(`Sample delta timestamp: ${sampleKey} = ${sampleDate.toISOString()}`);
+                    console.log(`[DB] Sample delta timestamp: ${sampleKey} = ${sampleDate.toISOString()}`);
                 } else {
-                    console.log('No delta data in Redis or database for this symbol/timeframe');
+                    console.log('[DB] No delta data in database for this symbol');
                 }
 
                 // Log big orders status
@@ -1234,118 +890,12 @@
                     const uniqueTimes = [...new Set(bigOrderTrades.map(t => t.time))];
                     console.log(`  Unique candle times: ${uniqueTimes.length} buckets`);
                 } else {
-                    console.log('No big orders found - check if bigOrderMinSize is too high or if data exists in Redis');
+                    console.log('No big orders found in database');
                 }
             } catch (e) {
-                console.warn('Failed to load delta data:', e.message);
+                console.warn('[DB] Failed to load delta data:', e.message);
                 var ver = document.getElementById('version');
-                if (ver) ver.textContent = 'v157 FETCH ERR';
-            }
-        }
-
-        // Load from database API (fallback and for historical data)
-        async function loadFromDatabaseAsync() {
-            try {
-                // Calculate time range (last 24 hours for historical data)
-                const now = Math.floor(Date.now() / 1000);
-                const twentyFourHoursAgo = now - (24 * 60 * 60);
-
-                // ALWAYS load 1m data from database (for aggregation into any timeframe)
-                const response = await fetch(
-                    `${DB_API_URL}?action=get_all&symbol=${CONFIG.symbol}&timeframe=1m&start=${twentyFourHoursAgo}&delta_limit=10000&order_limit=2000`
-                );
-
-                if (!response.ok) {
-                    console.warn('[DB] Failed to load from database: HTTP', response.status);
-                    return { deltaCount: 0, bigOrderCount: 0 };
-                }
-
-                const result = await response.json();
-                let deltaCount = 0;
-                let bigOrderCount = 0;
-
-                if (result.success) {
-                    const intervalSeconds = TIMEFRAME_MINUTES[TIMEFRAME] * 60;
-
-                    // Load and aggregate 1m delta data into current timeframe
-                    if (result.delta && result.delta.data) {
-                        const aggregated = new Map();
-
-                        Object.keys(result.delta.data).forEach(key => {
-                            const ts1m = parseInt(key);
-                            const record = result.delta.data[key];
-
-                            // Calculate which bucket this 1m record belongs to
-                            const bucketTime = Math.floor(ts1m / intervalSeconds) * intervalSeconds;
-
-                            // Skip if we already have native data for this bucket
-                            if (candleDeltaData.has(bucketTime)) {
-                                return;
-                            }
-
-                            if (!aggregated.has(bucketTime)) {
-                                aggregated.set(bucketTime, {
-                                    delta: 0,
-                                    maxDelta: -Infinity,
-                                    minDelta: Infinity,
-                                    volume: 0,
-                                    buyVolume: 0,
-                                    sellVolume: 0
-                                });
-                            }
-
-                            const agg = aggregated.get(bucketTime);
-                            agg.delta += (record.delta || 0);
-                            agg.maxDelta = Math.max(agg.maxDelta, agg.delta);
-                            agg.minDelta = Math.min(agg.minDelta, agg.delta);
-                            agg.volume += (record.volume || 0);
-                            agg.buyVolume += (record.buyVolume || 0);
-                            agg.sellVolume += (record.sellVolume || 0);
-                        });
-
-                        // Add aggregated data to candleDeltaData
-                        aggregated.forEach((data, bucketTime) => {
-                            if (!candleDeltaData.has(bucketTime)) {
-                                if (data.maxDelta === -Infinity) data.maxDelta = data.delta;
-                                if (data.minDelta === Infinity) data.minDelta = data.delta;
-                                candleDeltaData.set(bucketTime, data);
-                                deltaCount++;
-                            }
-                        });
-                    }
-
-                    // Load big orders and map to current timeframe buckets
-                    if (result.bigOrders && result.bigOrders.data) {
-                        result.bigOrders.data.forEach(order => {
-                            const ts1m = Number(order.time);
-                            // Map to current timeframe bucket
-                            const bucketTime = Math.floor(ts1m / intervalSeconds) * intervalSeconds;
-
-                            const t = {
-                                time: bucketTime,  // Use bucket time for display alignment
-                                price: Number(order.price),
-                                size: Number(order.size),
-                                side: order.side
-                            };
-                            if (t.price && t.size && t.side) {
-                                const sidePrefix = t.side === 'BUY' ? 'B' : 'A';
-                                const orderKey = `${sidePrefix}_${t.price}_${t.size}_${bucketTime}`;
-                                if (!seenMBOOrders.has(orderKey)) {
-                                    seenMBOOrders.add(orderKey);
-                                    bigOrderTrades.push(t);
-                                    bigOrderCount++;
-                                }
-                            }
-                        });
-                    }
-
-                    console.log(`[DB] Loaded ${deltaCount} delta records, ${bigOrderCount} big orders from database (aggregated to ${TIMEFRAME})`);
-                }
-
-                return { deltaCount, bigOrderCount };
-            } catch (e) {
-                console.warn('[DB] Failed to load from database:', e.message);
-                return { deltaCount: 0, bigOrderCount: 0 };
+                if (ver) ver.textContent = 'v158 LOAD ERR';
             }
         }
 
@@ -1802,10 +1352,8 @@
                     }
                 }, 5000);
 
-                // Periodically save delta data to Redis (every 10 seconds)
-                setInterval(() => {
-                    saveDeltaDataNow();
-                }, 10000);
+                // Note: Delta data is now saved by background collector (collector.js)
+                // No need to save from chart - just load and display
             };
 
             ws.onmessage = (event) => {
@@ -2282,8 +1830,8 @@
                 updateVolumeBar(updatedCandle);
 
             } else if (candleTime > lastCandleTime) {
-                // New candle starting - save delta data for previous candle
-                saveDeltaDataNow();
+                // New candle starting
+                // Note: Delta saving handled by background collector
 
                 const prevCandle = candleData[candleData.length - 1];
                 let useActualOpen = true;
@@ -2521,10 +2069,7 @@
                     deltaData.logged = (deltaData.logged || 0) + 1;
                 }
 
-                // Save periodically (not every tick to reduce overhead)
-                if (size >= 5) {
-                    saveDeltaData();
-                }
+                // Note: Saving handled by background collector - no need to save from chart
 
                 // Update grid
                 updateDeltaGrid();
@@ -3552,22 +3097,18 @@
                 aggregatedBigOrders.clear();
                 bigOrderTrades = [];
                 seenMBOOrders.clear();
-            priceVolumeMap.clear();
+                priceVolumeMap.clear();
                 sessionStats.bigOrderCount = 0;
                 candleOrderflow.clear();
 
-                // Clear Redis by saving empty data
-                const response = await fetch(`${DELTA_API_URL}?symbol=${CONFIG.symbol}&timeframe=${TIMEFRAME}&clear=1`, {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({})
-                });
+                // Note: Database data is preserved (managed by background collector)
+                // Only clearing in-memory data for current session
 
-                console.log('Cleared all delta data');
+                console.log('Cleared all in-memory delta data');
                 closeSettings();
                 rebuildChartMarkers();
                 updateDeltaGrid();
-                alert('All data cleared! Delta will start fresh from new ticks.');
+                alert('In-memory data cleared! Database data is preserved.\nRefresh to reload from database.');
             } catch (e) {
                 console.error('Failed to clear data:', e);
                 alert('Failed to clear data: ' + e.message);
@@ -3817,84 +3358,8 @@
                 }
             }
 
-            // Save delta data AND big orders before page unload
-            window.addEventListener('beforeunload', () => {
-                // Use sendBeacon for reliable save on page close
-                const data = {};
-
-                // Include delta data with individual bigOrderTrades
-                candleDeltaData.forEach((value, key) => {
-                    if (!value.estimated) {
-                        const keyNum = Number(key);
-                        const candle = candleData.find(c => c.time === keyNum);
-                        // Get individual big order trades for this candle (exact prices)
-                        const tradesForCandle = bigOrderTrades.filter(t => Number(t.time) === keyNum);
-                        // Only include bigOrderTrades if we have some (don't overwrite with null)
-                        const record = {
-                            ...value,
-                            candle: candle ? { o: candle.open, h: candle.high, l: candle.low, c: candle.close, v: candle.volume } : null
-                        };
-                        if (tradesForCandle.length > 0) {
-                            record.bigOrderTrades = tradesForCandle;
-                        }
-                        data[key] = record;
-                    }
-                });
-
-                // Also save big orders that don't have delta data yet
-                const candleTimesWithBigOrders = new Set(bigOrderTrades.map(t => Number(t.time)));
-                candleTimesWithBigOrders.forEach(candleTime => {
-                    const candleTimeKey = String(candleTime);
-                    if (!data[candleTimeKey]) {
-                        const candle = candleData.find(c => c.time === candleTime);
-                        const tradesForCandle = bigOrderTrades.filter(t => Number(t.time) === candleTime);
-                        data[candleTimeKey] = {
-                            delta: 0, volume: 0, buyVolume: 0, sellVolume: 0,
-                            candle: candle ? { o: candle.open, h: candle.high, l: candle.low, c: candle.close, v: candle.volume } : null,
-                            bigOrderTrades: tradesForCandle
-                        };
-                    }
-                });
-
-                if (Object.keys(data).length > 0) {
-                    console.log(`Saving ${Object.keys(data).length} records on unload (${bigOrderTrades.length} big orders)`);
-                    navigator.sendBeacon(
-                        `${DELTA_API_URL}?symbol=${CONFIG.symbol}&timeframe=${TIMEFRAME}`,
-                        JSON.stringify(data)
-                    );
-                }
-
-                // ALWAYS save 1m data on unload (for all timeframe aggregation)
-                if (TIMEFRAME !== '1m' && oneMinuteDeltaData.size > 0) {
-                    const data1m = {};
-                    oneMinuteDeltaData.forEach((value, key) => {
-                        const keyNum = Number(key);
-                        // Include big orders that belong to this 1m bucket
-                        const tradesFor1m = bigOrderTrades.filter(t => Number(t.time) === keyNum);
-                        data1m[key] = {
-                            ...value,
-                            bigOrderTrades: tradesFor1m.length > 0 ? tradesFor1m : undefined
-                        };
-                    });
-                    // Also add big orders without delta data
-                    bigOrderTrades.forEach(order => {
-                        const key = String(order.time);
-                        if (!data1m[key]) {
-                            data1m[key] = {
-                                delta: 0, volume: 0, buyVolume: 0, sellVolume: 0,
-                                bigOrderTrades: [order]
-                            };
-                        }
-                    });
-                    if (Object.keys(data1m).length > 0) {
-                        console.log(`[1m] Saving ${Object.keys(data1m).length} 1m records with big orders on unload`);
-                        navigator.sendBeacon(
-                            `${DELTA_API_URL}?symbol=${CONFIG.symbol}&timeframe=1m`,
-                            JSON.stringify(data1m)
-                        );
-                    }
-                }
-            });
+            // Note: Delta data saving is handled by background collector (collector.js)
+            // No need to save on unload - collector saves to database continuously
         });
     </script>
 </body>
